@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+#
+# Wrapper script for ioping. Can be implemented in to a cron
+# job or as an NRPE command for nagios. Use --perfdata to generate perfdata
+# for Nagios to consume
+#
+# I needed a way to track I/O latency on a VM hypervisor node (ovirt)
+# because the ovirt engine kept reporting latencies but it was the only one
+# reporting it (and guaranteed not a config issue). I set this up in nagios 
+# to run every minute and run for 15 runs which is usually ~15 seconds
+#
+#
+# It is suggested to first get a baseline for what your system looks like by
+# running the script with all zeros for crit/warn then using "raw data" line 
+# to generate some  values you consider warn/critical. I used a 
+# count of 120 (2 minutes) then min/max/avg * 1.5 for warning and * 2.5 for critical
+#
+#	* While running this I did the following on my home directory
+#
+#		while [ true ]; do ls -alhtrR $HOME; done
+#
+#	to generate some I/O without using DD, figured all the stat() calls would be
+#	better geared towards real use 
+#
+#
+# Example:
+#
+#	./iomonitor --directory /tmp --min-warn 0 --min-crit 0 --max-warn 0 --max-crit 0 --avg-warn 0 --avg-crit 0 --count 120
+#
+
+
+# Check dependencies
+if [ -z $(command -v ioping) ]; then
+	echo "* ERROR: Cannot find ioping command"
+	exit 254
+fi
+
+if [ -z $(command -v bc) ]; then
+	echo "* ERROR: Cannot find bc command"
+	exit 254
+fi
+
+
+# This prints when using the -v flag
+function debug_write() {
+        if [ ${dbg} ]; then
+                echo "* $@"
+        else
+                return
+        fi
+}
+
+
+# Collect arguments
+setargs(){
+	while [ "$1" != "" ]; do
+    		case $1 in
+      			"--min-warn")
+        			shift
+       			 	min_warn=$1
+        		;;
+			"--min-crit")
+				shift
+				min_crit=$1
+			;;
+
+			"--max-warn")
+                                shift
+                                max_warn=$1
+                        ;;
+                        "--max-crit")
+                                shift
+                                max_crit=$1
+                        ;;
+
+			"--avg-warn")
+                                shift
+                                avg_warn=$1
+                        ;;
+                        "--avg-crit")
+                                shift
+                                avg_crit=$1
+                        ;;
+
+			"-c" | "--count" )
+				shift
+				count=$1
+			;;
+			
+      			"-d" | "--directory")
+				shift
+        			directory="$1"
+        		;;
+			"--nagios-perfdata")
+				perfdata=1
+			;;	
+			"-v" | "--verbose")
+				#shift
+				dbg=1
+			;;
+			
+    		esac
+
+    		shift
+  	done
+}
+
+setargs "$@"
+
+# Startup
+debug_write "min_warn=${min_warn}"
+debug_write "min_crit=${min_crit}"
+debug_write "max_warn=${max_warn}"
+debug_write "max_crit=${max_crit}"
+debug_write "avg_warn=${avg_warn}"
+debug_write "avg_crit=${avg_crit}"
+debug_write "count=${count}"
+debug_write "directory=${directory}"
+
+# If count is empty, default to 15
+if [ -z ${count} ]; then
+	count=15
+fi
+
+# Move in to the directory for ioping to run
+cd "${directory}"
+cdres=$?
+if [ ${cdres} -ne 0 ]; then
+	echo "* ERROR: Failed to CD to ${directory} to run ioping test. Exiting"
+	exit 254
+fi
+
+# Stuff
+debug_write "Current directory - $(pwd)"
+
+# Run ioping
+debug_write "Running ${count} times"
+cmd=$(ioping -c ${count} .)
+
+# --verbose
+debug_write "output: ${cmd}"
+
+# Grep the line we care about
+line=$(echo "${cmd}" | grep "^min/avg/max/mdev" )
+debug_write "line: '${line}'"
+
+# Now awk the fields out
+data_lines=$(echo "${line}" | awk '{ print $3 " " $4 "\n" $6 " " $7 "\n" $9 " " $10 "\n" $12 " " $13 };')
+
+# Array for data parsing
+declare -a data
+
+# Conversions
+SAVEIFS=$IFS
+IFS=$(echo -en "\n\b")
+count=0
+for i in $(echo "${data_lines}"); do
+	# TODO: Make what to convert to an argument
+	# we default now to seconds. People may want to monitor at ms level
+	#... but I suck at math
+
+	value=$(echo "$i" | cut -d ' ' -f1)
+	unit=$(echo "$i" | cut -d ' ' -f2)
+	case "${unit}" in
+		ns)
+			conversion="0.000000001"
+		;;
+		us)
+			conversion="0.000001"
+		;;
+		ms)
+			conversion="0.001"
+		;;
+		s)	
+			conversion="1"
+		;;
+		m)
+			conversion="60"
+		;;
+		h)
+			conversion="3600"
+		;;
+		*)
+			echo "* ERROR: Received unit we could not convert. Got ${unit}"
+			exit 245
+		;;
+	esac
+
+	debug_write "(${unit}) - ${value} * ${conversion}"
+	converted=$(echo "scale=6; ${value} * ${conversion}" | bc | awk '{printf "%f", $0}')
+
+	data[${count}]=${converted}
+	count=$((${count}+1))
+done
+IFS=$SAVEIFS
+
+
+min=${data[0]}
+avg=${data[1]}
+max=${data[2]}
+mdev=${data[3]}
+debug_write "Converted to seconds: $min / $avg / $max / $mdev"
+
+
+# now check warn/crit
+exit_crit=0
+exit_warn=0
+output=""
+perfdataoutput=""
+
+# Because im lazy and using a function is prettier
+function append() {
+	output="${output}$@"
+}
+
+function perfdata_append() { 
+	perfdataoutput="${perfdataoutput}$@ "
+}
+
+# Use BC to do float comparison
+function comp() { 
+	bc <<< "$@"
+	return $?
+}	
+
+
+# Iterate the fields we need. Doing it this way avoids repeat code
+# Why repeat code when we can use bashes flexibility?!
+for i in $(echo min max avg); do
+
+	# Yay bash variable substitution!
+	# use the value when we need to and the variable name when we need to
+	# ex: ${idx_name} would expand to min then $idx_warn would expand to min_warn
+	# so when we use ${!idx_warn} it would expand to min_warn value (the arg input field)
+	idx_inner_val="${!i}"
+	idx_name="$i"
+	idx_warn="${idx_name}_warn"
+	idx_crit="${idx_name}_crit"
+	
+	debug_write "${idx_inner_val} > ${!idx_warn}" 
+	debug_write "${idx_inner_val} < ${!idx_crit}"
+
+	if [ $(comp "${idx_inner_val} > ${!idx_warn}" ) -eq 1 ] && [ $(comp "${idx_inner_val} < ${!idx_crit}" ) -eq 1 ]; then
+	        append " * WARNING: '$directory' storage latency min response time ${idx_inner_val} > ${!idx_warn}\n"
+		exit_warn=1
+	fi
+	
+	if [ $(comp "${idx_inner_val} > ${!idx_crit}" ) -eq 1 ]; then
+	        append " * CRITICAL: '$directory' storage latency min response time ${idx_inner_val} > ${!idx_crit}\n"
+	        exit_crit=1
+	fi
+
+	perfdata_append "${idx_name}=${idx_inner_val}"
+
+done
+
+# May as well print the raw data when we print anything else or the OK
+append "raw data: ${line}"
+
+
+# Warn / crit / OK logic 
+
+# Crit
+if [ ${exit_crit} -eq 1 ]; then
+	echo -e "${output}" 
+	if [ ! -z "${perfdata}" ]; then
+		echo -e " | ${perfdataoutput}"
+	fi
+	exit 2
+fi
+
+# Warn
+if [ ${exit_warn} -eq 1 ]; then
+	echo -e "${output}" 
+	if [ ! -z "${perfdata}" ]; then
+                echo -e " | ${perfdataoutput}"
+        fi
+	exit 1
+fi
+
+# Else OK 
+echo -e "OK - ${directory} latency - ${output}" | tr -d '\n'
+if [ ! -z "${perfdata}" ]; then
+	echo -e " | ${perfdataoutput}"
+fi
+
+
+exit 0
+
