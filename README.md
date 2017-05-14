@@ -11,3 +11,7 @@ It is suggested to first get a baseline for what your system looks like by
 running the script with all zeros for crit/warn then using "raw data" line 
 to generate some  values you consider warn/critical. I used a 
 count of 120 (2 minutes) then min/max/avg * 1.5 for warning and * 2.5 for critical
+
+# Requirements
+
+You must have ioping installed. You can find it here - https://github.com/koct9i/ioping 
