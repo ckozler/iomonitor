@@ -242,12 +242,12 @@ for i in $(echo min max avg); do
 	debug_write "${idx_inner_val} < ${!idx_crit}"
 
 	if [ $(comp "${idx_inner_val} > ${!idx_warn}" ) -eq 1 ] && [ $(comp "${idx_inner_val} < ${!idx_crit}" ) -eq 1 ]; then
-	        append " * WARNING: '$directory' storage latency min response time ${idx_inner_val} > ${!idx_warn}\n"
+	        append " * WARNING: '$directory' storage latency ${idx_name} response time ${idx_inner_val} > ${!idx_warn}\n"
 		exit_warn=1
 	fi
 	
 	if [ $(comp "${idx_inner_val} > ${!idx_crit}" ) -eq 1 ]; then
-	        append " * CRITICAL: '$directory' storage latency min response time ${idx_inner_val} > ${!idx_crit}\n"
+	        append " * CRITICAL: '$directory' storage latency ${idx_name} response time ${idx_inner_val} > ${!idx_crit}\n"
 	        exit_crit=1
 	fi
 
